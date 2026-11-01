@@ -15,8 +15,8 @@ migrate = ""
 # headless Chrome into the persistent data dir for frame screenshots.
 commands = [
   "bun run build",
-  "bunx @puppeteer/browsers install chrome-headless-shell@stable --path \"$OX_DATA_DIR/chrome\"",
-  "ln -sfn \"$(find \"$OX_DATA_DIR/chrome\" -type f -name chrome-headless-shell | head -n 1)\" \"$OX_DATA_DIR/chrome-headless-shell\"",
+  "bunx @puppeteer/browsers install chrome-headless-shell@stable --path \"$OX_DATA_DIR/chrome-browsers\"",
+  "ln -sfn \"$(find \"$OX_DATA_DIR/chrome-browsers\" -type f -name chrome-headless-shell | head -n 1)\" \"$OX_DATA_DIR/chrome-headless-shell\"",
 ]
 
 [tools]
