@@ -2,3 +2,7 @@
 # must not run drizzle-kit, which has no database URL to read.
 [build]
 migrate = ""
+
+[tools]
+# tsx runs under Node; without it ox left `node` to Bun, which cannot load tsx.
+node = "22"
