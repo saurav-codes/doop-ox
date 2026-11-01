@@ -1,0 +1,4 @@
+# Doop runs its own migrations at boot (server/db/index.ts), so ox
+# must not run drizzle-kit, which has no database URL to read.
+[build]
+migrate = ""
