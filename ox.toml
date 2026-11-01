@@ -6,3 +6,6 @@ migrate = ""
 [tools]
 # tsx runs under Node; without it ox left `node` to Bun, which cannot load tsx.
 node = "22"
+
+[services]
+postgres = {}
