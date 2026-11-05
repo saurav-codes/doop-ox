@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { roleOf, toolAllowed, useStore, type Viewport } from '../lib/store'
+import { usePaper, type Paper } from '../lib/paper'
 import { roleAllows } from '../../shared/canvasRole'
 import { onViewCommand } from '../lib/viewMenu'
 import type { Frame } from '../../shared/types'
@@ -61,6 +62,13 @@ const MAX_ZOOM = 16
    included, like the Hand tool's grab — except inside the comment UI itself
    (pins, composer, threads: `data-comment-ui`), which keeps its own cursors. */
 const COMMENT_CURSOR = 'cursor-comment! [&_:not([data-comment-ui]_*)]:cursor-comment!'
+/* The Path tool's pen, forced over the frames the same way; the badge follows
+   what a press would do (src/styles.css draws them) */
+const PEN_CURSOR = {
+  pen: 'cursor-pen! [&_:not([data-comment-ui]_*)]:cursor-pen!',
+  'pen-close': 'cursor-pen-close! [&_:not([data-comment-ui]_*)]:cursor-pen-close!',
+  'pen-anchor': 'cursor-pen-anchor! [&_:not([data-comment-ui]_*)]:cursor-pen-anchor!',
+} as const
 
 /* The world is laid out at CSS zoom k, the settled camera zoom, and its
    transform carries only what the camera has moved since. WebKit rasterizes a
@@ -130,6 +138,16 @@ const sendViewport = throttle(
   50,
 )
 
+/** The stage's own paint when the page has a colour: the colour, and a dot
+ *  grid that reads on it (the theme's dots are tuned to the theme paper). */
+function paperStyle(paper: Paper): CSSProperties {
+  if (!paper.background) return {}
+  return {
+    background: paper.background,
+    ['--dot' as string]: paper.tone === 'dark' ? 'rgba(255, 255, 255, 0.09)' : 'rgba(0, 0, 0, 0.09)',
+  }
+}
+
 export function Stage({
   onAddFrame,
   insets = NO_INSETS,
@@ -186,6 +204,8 @@ export function Stage({
   const setViewport = useStore((s) => s.setViewport)
   const canvas = usePageCanvas()
   const activePageId = useStore((s) => s.activePageId)
+  /* a page with a colour of its own paints the stage, dots in its contrast */
+  const paper = usePaper()
   const select = useStore((s) => s.select)
   const panMode = useStore((s) => s.panMode)
   /* ⌘. — the tool pill and the zoom pill go with the rest of the chrome */
@@ -907,10 +927,12 @@ export function Stage({
                     : isDrawingTool(tool)
                       ? tool === 'text'
                         ? 'cursor-text! [&_:not([data-comment-ui]_*)]:cursor-text!'
-                        : 'cursor-crosshair! [&_:not([data-comment-ui]_*)]:cursor-crosshair!'
+                        : tool === 'path'
+                          ? PEN_CURSOR[drawing.penCursor]
+                          : 'cursor-crosshair! [&_:not([data-comment-ui]_*)]:cursor-crosshair!'
                       : 'cursor-default',
             )}
-            style={bounds}
+            style={{ ...bounds, ...paperStyle(paper) }}
             onPointerDownCapture={drawing.onPointerDown}
             onDoubleClickCapture={drawing.onDoubleClick}
             onTouchStartCapture={drawing.onTouchStart}
@@ -944,13 +966,7 @@ export function Stage({
               ref={worldRef}
             >
               <FrameLabelLayer.Provider value={labelLayer}>
-                {canvas?.frames.map((f) =>
-                  f.hidden ? (
-                    <HiddenFrameView key={f.id} frame={f} />
-                  ) : (
-                    <FrameView key={f.id} frame={f} layoutZoom={layoutZoom} />
-                  ),
-                )}
+                <FrameStack frames={canvas?.frames ?? []} layoutZoom={layoutZoom} />
               </FrameLabelLayer.Provider>
               <GhostFrames />
               <FlowOverlay />
@@ -1141,6 +1157,33 @@ function ModeSwitch({ canComment }: { canComment: boolean }) {
           </ToolbarButton>
         </Tooltip>
       ))}
+    </div>
+  )
+}
+
+/* the order frames mount in: creation, then id (frames copied together
+   share a creation time), neither of which ever changes */
+function byCreation(a: Frame, b: Frame) {
+  return a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+}
+
+/** The page's frames, `frames` in paint order (back to front, as the store
+ *  keeps them). They mount in creation order and stack by z-index: moving
+ *  an iframe in the DOM reloads it, so a restack must not move any. The
+ *  layer isolates the stack, so the overlays after it (cursors, guides, the
+ *  marquee) stay above every frame. */
+function FrameStack({ frames, layoutZoom }: { frames: Frame[]; layoutZoom: number }) {
+  const mounted = useMemo(() => [...frames].sort(byCreation), [frames])
+  const rank = useMemo(() => new Map(frames.map((f, i) => [f.id, i + 1])), [frames])
+  return (
+    <div className="absolute top-0 left-0 isolate">
+      {mounted.map((f) =>
+        f.hidden ? (
+          <HiddenFrameView key={f.id} frame={f} stack={rank.get(f.id)} />
+        ) : (
+          <FrameView key={f.id} frame={f} stack={rank.get(f.id)} layoutZoom={layoutZoom} />
+        ),
+      )}
     </div>
   )
 }

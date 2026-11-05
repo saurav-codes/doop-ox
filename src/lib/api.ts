@@ -1,8 +1,10 @@
 import { useStore } from './store'
 import { beginFrameSave } from './frameSaves'
+import type { StackWrite } from '../../shared/frameStack'
 import type { LocalAgentPreference, LocalAgentJob, LocalAgentResult } from '../../shared/localAgent'
 import type { NotificationPrefs, NotificationSettings } from '../../shared/notifications'
 import type { WebhookDeliveryResult, WebhookEventType, WebhookInfo } from '../../shared/webhooks'
+import type { AgentFeedbackKind, AgentFeedbackReport } from '../../shared/agentFeedback'
 import type {
   ActivityItem,
   Canvas,
@@ -24,6 +26,8 @@ import type { Automation, AutomationRun, AutomationTrigger, Schedule, Step } fro
 import type { BillingInterval, Plan } from '../../shared/billing'
 import type { LinkAccess } from '../../shared/canvasRole'
 import type { CommentAnchorInput } from '../../shared/comments'
+import type { CustomFont } from '../../shared/fonts'
+import type { DesignToken, DesignTokenInput, ThemeRename, TokenEdit, TokenResult } from '../../shared/designTokens'
 
 export type HomeActivity = ActivityItem & { canvasId: string; canvasName: string }
 
@@ -31,6 +35,8 @@ export interface CanvasMember {
   userId: string
   name: string
   email: string
+  /** the profile photo's URL when the person uploaded one */
+  image?: string
   owner: boolean
 }
 
@@ -286,6 +292,25 @@ export const api = {
   updateWebhook: (id: string, patch: { url?: string; events?: WebhookEventType[]; enabled?: boolean }) =>
     req<WebhookInfo>(`/api/webhooks/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   deleteWebhook: (id: string) => req<{ ok: boolean }>(`/api/webhooks/${id}`, { method: 'DELETE' }),
+  /* font libraries: a workspace's with an id, the signed-in person's without */
+  listFonts: (workspaceId?: string) =>
+    req<CustomFont[]>(`/api/fonts${workspaceId ? `?workspace=${encodeURIComponent(workspaceId)}` : ''}`),
+  uploadFont: (file: File, workspaceId?: string) =>
+    req<CustomFont>(`/api/fonts${workspaceId ? `?workspace=${encodeURIComponent(workspaceId)}` : ''}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': encodeURIComponent(file.name) },
+      body: file,
+    }),
+  deleteFont: (id: string) => req<{ ok: boolean }>(`/api/fonts/${id}`, { method: 'DELETE' }),
+  /* the profile photo: raw bytes in, the face's URL out */
+  uploadAvatar: (file: File) =>
+    req<{ image: string }>('/api/me/avatar', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: file,
+    }),
+  removeAvatar: () => req<{ ok: boolean }>('/api/me/avatar', { method: 'DELETE' }),
+  canvasFonts: (canvasId: string) => req<CustomFont[]>(`/api/canvases/${canvasId}/fonts`),
   rotateWebhookSecret: (id: string) => req<{ secret: string }>(`/api/webhooks/${id}/rotate`, { method: 'POST' }),
   testWebhook: (id: string) => req<WebhookDeliveryResult>(`/api/webhooks/${id}/test`, { method: 'POST' }),
   notificationSettings: () => req<NotificationSettings>('/api/notifications'),
@@ -376,6 +401,29 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ markdown, ...(title !== undefined ? { title } : {}) }),
     }),
+  /* design tokens */
+  createTokens: (canvasId: string, tokens: DesignTokenInput[]) =>
+    req<{ results: TokenResult[]; tokens: DesignToken[] }>(`/api/canvases/${canvasId}/tokens`, {
+      method: 'POST',
+      body: JSON.stringify({ tokens }),
+    }),
+  setToken: (canvasId: string, name: string, edit: Omit<TokenEdit, 'name'>) =>
+    req<{ result: TokenResult; tokens: DesignToken[] }>(
+      `/api/canvases/${canvasId}/tokens/${encodeURIComponent(name)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(edit),
+      },
+    ),
+  setTokenThemes: (canvasId: string, themes: string[], renames: ThemeRename[] = []) =>
+    req<{ themes: string[]; tokens: DesignToken[] }>(`/api/canvases/${canvasId}/token-themes`, {
+      method: 'PUT',
+      body: JSON.stringify({ themes, ...(renames.length ? { renames } : {}) }),
+    }),
+  deleteToken: (canvasId: string, name: string) =>
+    req<{ ok: boolean; tokens: DesignToken[] }>(`/api/canvases/${canvasId}/tokens/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    }),
   /* design memory */
   pinReference: (canvasId: string, frameId: string) =>
     req(`/api/canvases/${canvasId}/references`, { method: 'POST', body: JSON.stringify({ frameId }) }),
@@ -417,6 +465,11 @@ export const api = {
       `/api/canvases/${canvasId}/pages/${encodeURIComponent(pageId)}/flow-start`,
       { method: 'PUT', body: JSON.stringify({ frameId }) },
     ),
+  setPageBackground: (canvasId: string, pageId: string, color: string | null) =>
+    req<import('../../shared/types').CanvasPageInfo[]>(
+      `/api/canvases/${canvasId}/pages/${encodeURIComponent(pageId)}/background`,
+      { method: 'PUT', body: JSON.stringify({ color }) },
+    ),
   putGuide: (canvasId: string, guide: import('../../shared/types').CanvasGuide) =>
     req<import('../../shared/types').CanvasGuide>(`/api/canvases/${canvasId}/guides/${guide.id}`, {
       method: 'PUT',
@@ -451,6 +504,9 @@ export const api = {
       finish()
     }
   },
+  /* several frames' stacking order at once, all or nothing */
+  restackFrames: (canvasId: string, frames: StackWrite[]) =>
+    req<Frame[]>(`/api/canvases/${canvasId}/stack`, { method: 'PUT', body: JSON.stringify({ frames }) }),
   deleteFrame: (frameId: string, expectedUpdatedAt?: number) =>
     req('/api/frames/' + frameId, { method: 'DELETE', body: JSON.stringify({ expectedUpdatedAt, actor: actor() }) }),
   setFrameApproval: (frameId: string, status: 'ready_for_dev' | 'draft', expectedUpdatedAt: number) =>
@@ -522,12 +578,20 @@ export const api = {
     req(`/api/canvases/${canvasId}/cards/${cardId}/retry`, { method: 'POST' }),
   stopCard: (canvasId: string, cardId: string) =>
     req(`/api/canvases/${canvasId}/cards/${cardId}/stop`, { method: 'POST' }),
-  /** x/y: where a comment on the frame as a whole was left, in design px */
+  /** x/y: where the comment was left, in frame design px */
   /** a comment on an element (its positional selector, which the server turns into a stamped
    *  data-doop-id, or the id it already carries) or, with neither, on the frame at the point */
   addComment: (
     frameId: string,
-    input: { selector?: string; elementId?: string; snippet: string; text: string; x: number; y: number },
+    input: {
+      selector?: string
+      elementId?: string
+      snippet: string
+      text: string
+      x: number
+      y: number
+      elementOrigin?: { x: number; y: number }
+    },
   ) => req<ElementComment>(`/api/frames/${frameId}/comments`, { method: 'POST', body: JSON.stringify(input) }),
   /** the stable id of the element a positional selector names, stamped into the frame if needed */
   ensureElementId: (frameId: string, selector: string, snippet?: string) =>
@@ -611,12 +675,36 @@ export interface AdminUser {
   canvasCount: number
 }
 
+export interface AdminAgentFeedback extends AgentFeedbackReport {
+  user?: { id: string; name: string; email: string }
+}
+
+export interface AdminAgentFeedbackPage {
+  reports: AdminAgentFeedback[]
+  counts: Record<AgentFeedbackKind, number>
+  hasMore: boolean
+}
+
+export interface AdminStats {
+  users: number
+  canvases: number
+  frames: number
+  agentFeedback: number
+}
+
 /** Instance-admin surface. Every route 404s for non-admins, so a failure here
  *  is indistinguishable from the feature not existing — which is the point. */
 export const adminApi = {
   canvases: () => req<{ total: number; canvases: AdminCanvas[] }>('/api/admin/canvases'),
-  stats: () => req<{ users: number; canvases: number; frames: number }>('/api/admin/stats'),
+  stats: () => req<AdminStats>('/api/admin/stats'),
   users: () => req<AdminUser[]>('/api/admin/users'),
+  agentFeedback: (query: { kind?: AgentFeedbackKind; q?: string; before?: AdminAgentFeedback }) => {
+    const params = new URLSearchParams()
+    if (query.kind) params.set('kind', query.kind)
+    if (query.q) params.set('q', query.q)
+    if (query.before) params.set('before', `${query.before.at}:${query.before.id}`)
+    return req<AdminAgentFeedbackPage>(`/api/admin/agent-feedback?${params}`)
+  },
 
   /* better-auth's own endpoints, not ours: they swap the session cookie, so
      every caller reloads afterwards rather than trying to reconcile state. */

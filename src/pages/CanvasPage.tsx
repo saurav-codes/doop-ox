@@ -1,6 +1,17 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { canEditOpenCanvas, pickedSelectors, roleOf, useStore } from '../lib/store'
-import { MOD_KEY, isHideUiShortcut } from '../lib/keys'
+import {
+  MOD_KEY,
+  PRESENT_SHORTCUT_HINT,
+  isControlTarget,
+  isHideUiShortcut,
+  isPresentShortcut,
+  isSelectAllShortcut,
+  isTypingTarget,
+  reorderShortcut,
+} from '../lib/keys'
+import { enterSelection, exitSelection, reorderSelection, selectAll, selectSibling } from '../lib/selectionKeys'
+import { presentStartFrame } from '../lib/present'
 import { canHideUi, hideUiHinted } from '../lib/hideUi'
 import { connect, disconnect, sendWs } from '../lib/ws'
 import {
@@ -30,6 +41,7 @@ import { LivePresence } from '../components/LivePresence'
 import { ensureTab } from '../lib/desktop'
 import { Stage } from '../components/Stage'
 import { Inspector } from '../components/Inspector'
+import { PagePanel } from '../components/PagePanel'
 import { ElementPanel } from '../components/ElementPanel'
 import { ActivityPanel } from '../components/ActivityPanel'
 import { ConnectModal } from '../components/ConnectModal'
@@ -40,8 +52,7 @@ import { LayersPanel, LayersRailToggle } from '../components/LayersPanel'
 import { Onboarding } from '../components/Onboarding'
 import { ShareModal } from '../components/ShareModal'
 import { ExportModal } from '../components/ExportModal'
-import { canvasPages, pageFrames } from '../../shared/pages'
-import { flowStartFrame } from '../../shared/prototype'
+import { pageFrames } from '../../shared/pages'
 import type { Frame } from '../../shared/types'
 import { ImportStepFooter, ImportStepHeader, SourcePicker } from '../components/ImportSources'
 import { importSources } from '../components/importSourceList'
@@ -49,11 +60,14 @@ import { PresentMode } from '../components/PresentMode'
 import { getIdentity, setName } from '../lib/identity'
 import {
   copyFrames,
-  dropImages,
+  dropFiles,
   duplicateFrames,
   hasFrameClip,
+  hasIncoming,
   pasteFrameCentered,
-  pasteImagesCentered,
+  pasteFilesCentered,
+  splitIncoming,
+  svgMarkupOf,
 } from '../lib/frameClipboard'
 import { clearHistory, redo, undo } from '../lib/history'
 import {
@@ -62,9 +76,13 @@ import {
   nudgeSelection,
   toggleLockSelection,
   toggleSelectionHidden,
+  formatSelectionText,
 } from '../lib/layerEdits'
-import { copyLayers, hasElementClip, pasteLayer } from '../lib/elementClipboard'
+import type { TextFormatCommand } from '../lib/richText'
+import { copyPicked, hasElementClip, pasteLayer } from '../lib/elementClipboard'
+import { isCanvasClipboard, writeCanvasClipboard } from '../lib/canvasClipboard'
 import { authClient } from '../lib/auth'
+import { avatarUrl } from '../../shared/avatar'
 import { posthog } from '../lib/posthog'
 import { useIsMobile } from '../hooks/use-mobile'
 import { cn } from '@/lib/utils'
@@ -81,6 +99,7 @@ import {
   GithubIcon,
   ImportIcon,
   LayersIcon,
+  LinkIcon,
   MoreHorizontalIcon,
   PlayIcon,
   PlusIcon,
@@ -91,7 +110,14 @@ import {
   WebIcon,
   XIcon,
 } from '../components/ui/icons'
-import { Badge } from '../components/ui/badge'
+import { Badge, badgeVariants } from '../components/ui/badge'
+import { Pressable } from '../components/ui/pressable'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '../components/ui/dropdown-menu'
 import { SelectionBar, SelectionBarAction } from '../components/ui/selection-bar'
 import { Input } from '../components/ui/input'
 import { Field } from '../components/ui/field'
@@ -106,6 +132,7 @@ import { createCenteredFrame } from '../lib/framePlacement'
 import { RULER_PX } from '../components/Rulers'
 import { NO_CANVAS, onViewCommand, syncViewMenu } from '../lib/viewMenu'
 import { AGENTS_MIN, LAYERS_MIN, fitPanelWidths } from '../lib/panelWidths'
+import { loadCanvasFonts } from '../lib/customFonts'
 import { t as translate, useT } from '../lib/i18n'
 import { NO_INSETS, type StageInsets } from '../lib/viewFit'
 import { usePanelLayout } from '../lib/panelLayout'
@@ -127,6 +154,14 @@ const ARROW_NUDGE: Record<string, [number, number]> = {
   ArrowRight: [1, 0],
   ArrowUp: [0, -1],
   ArrowDown: [0, 1],
+}
+const LETTER_FORMATS: Record<string, TextFormatCommand> = { b: 'bold', i: 'italic', u: 'underline' }
+
+/** The text format a canvas key chord names: letters without ⇧, the ⇧ digits by code (⇧7 is & on US keyboards). */
+function layerTextShortcut(e: KeyboardEvent): TextFormatCommand | null {
+  if (!e.shiftKey) return LETTER_FORMATS[e.key.toLowerCase()] ?? null
+  if (e.key.toLowerCase() === 'x') return 'strikeThrough'
+  return e.code === 'Digit7' ? 'insertOrderedList' : e.code === 'Digit8' ? 'insertUnorderedList' : null
 }
 const LAYERS_W = 264
 const RAIL_W = 40
@@ -254,11 +289,10 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
   const hideUiActive = canHideUi({ view: 'canvas', presenting: !!presenting })
   const activePageId = useStore((s) => s.activePageId)
   /* Play starts on the selected frame, or on the page's flow start */
-  const playFrom = useMemo(() => {
-    if (selectedId) return selectedId
-    if (!canvas) return null
-    return flowStartFrame(canvas, activePageId ?? canvasPages(canvas)[0]!.id)?.id ?? null
-  }, [selectedId, canvas, activePageId])
+  const playFrom = useMemo(
+    () => presentStartFrame(canvas, selectedId, activePageId),
+    [selectedId, canvas, activePageId],
+  )
   /* returning from a GitHub App install: the setup redirect appends a signed
      pass — pull it off the URL and open the import modal on the repo picker */
   const [ghInstallPass, setGhInstallPass] = useState<string | null>(() => {
@@ -316,6 +350,21 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
     }
   }, [canvasId, select])
 
+  /* the font library, again when the canvas moves between workspaces (its
+     library is the workspace's) and on return to the tab, so a font
+     uploaded in Settings in another tab shows up without a reload */
+  const loadedCanvasId = canvas?.id === canvasId ? canvasId : null
+  const fontScope = canvas?.workspaceId ?? null
+  useEffect(() => {
+    if (!loadedCanvasId) return
+    loadCanvasFonts(loadedCanvasId)
+    const refresh = () => {
+      if (document.visibilityState === 'visible') loadCanvasFonts(loadedCanvasId)
+    }
+    document.addEventListener('visibilitychange', refresh)
+    return () => document.removeEventListener('visibilitychange', refresh)
+  }, [loadedCanvasId, fontScope])
+
   /* broadcast which frame I'm focused on */
   useEffect(() => {
     sendWs({ type: 'editing', frameId: selectedId })
@@ -335,17 +384,49 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
         useStore.getState().requestComposerFocus()
         return
       }
-      const target = e.target as HTMLElement
-      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return
+      if (isTypingTarget(e.target)) return
       const selectedIds = useStore.getState().selectedIds
       /* a picked element (from the canvas or the layers tree) is what ⌫
          removes — the frame it lives in only goes when nothing inside it is
          selected. Auto-repeat is ignored: a held key must not take the
-         element and then, on the next repeat, the frame under it. */
+         element and then, on the next repeat, the frame under it. The key is
+         always claimed, deleted something or not: an unhandled Backspace is
+         "back" to some engines (WebKitGTK, the Linux desktop app), and a
+         canvas must never leave the page for it. */
       const canEdit = canEditOpenCanvas(useStore.getState())
-      if (canEdit && (e.key === 'Delete' || e.key === 'Backspace') && !e.repeat && deleteSelection()) e.preventDefault()
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault()
+        if (canEdit && !e.repeat) deleteSelection()
+      }
+      /* Figma's walk of the selection: ↩ into it, ⇧↩ out to the parent, Tab
+         and ⇧Tab along the siblings. Only the bare keys, and only when no
+         control (a button, a menu, the Layers tree) has the keyboard — there
+         ↩ presses and Tab moves focus, as they must. An unhandled key is left
+         alone, so Tab still walks the chrome when nothing is selected. */
+      const bare = !e.metaKey && !e.ctrlKey && !e.altKey
+      if (bare && !presenting && (e.key === 'Enter' || e.key === 'Tab') && !isControlTarget(e.target)) {
+        const moved =
+          e.key === 'Enter' ? (e.shiftKey ? exitSelection() : enterSelection()) : selectSibling(e.shiftKey ? -1 : 1)
+        if (moved) {
+          e.preventDefault()
+          return
+        }
+      }
+      /* ⌘A: every frame on the page, or every sibling of the picked element */
+      if (isSelectAllShortcut(e) && !presenting) {
+        e.preventDefault()
+        selectAll()
+        return
+      }
+      /* ⌘] / ⌘[ and ⌘⌥] / ⌘⌥[ restack what is selected */
+      const reorder = reorderShortcut(e)
+      if (reorder && canEdit && !presenting) {
+        e.preventDefault()
+        reorderSelection(reorder)
+        return
+      }
       const nudge = ARROW_NUDGE[e.key]
-      if (canEdit && nudge && t.tagName !== 'SELECT' && !e.defaultPrevented && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (canEdit && nudge && !e.defaultPrevented && !e.metaKey && !e.ctrlKey && !e.altKey) {
         const step = e.shiftKey ? 10 : 1
         if (nudgeSelection(nudge[0] * step, nudge[1] * step)) e.preventDefault()
         return
@@ -361,7 +442,16 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
         toggleHideUi()
         return
       }
-      /* undo, redo, hide, lock and duplicate all change the canvas; ⌘C does not */
+      /* ⌘⌥↩ presents from the selected frame (else the page's flow start),
+         as the Play button does; while presenting the player owns the keys */
+      if (isPresentShortcut(e) && !presenting) {
+        e.preventDefault()
+        const state = useStore.getState()
+        const from = presentStartFrame(state.canvas, state.selectedId, state.activePageId)
+        if (from) setPresenting(from)
+        return
+      }
+      /* undo, redo, hide, lock and duplicate all change the canvas */
       if (canEdit && (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'z') {
         e.preventDefault()
         if (e.shiftKey) void redo()
@@ -379,6 +469,12 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
         if (toggleSelectionHidden()) e.preventDefault()
         return
       }
+      /* ⌘B / ⌘I / ⌘U, ⌘⇧X and ⌘⇧7 / ⌘⇧8 format a picked text layer whole, as in Figma */
+      const textFormat = canEdit && (e.metaKey || e.ctrlKey) && !e.altKey ? layerTextShortcut(e) : null
+      if (textFormat) {
+        if (formatSelectionText(textFormat)) e.preventDefault()
+        return
+      }
       /* ⌘⇧L locks or unlocks what is selected: the picked layer, else the frames */
       if (canEdit && (e.metaKey || e.ctrlKey) && e.shiftKey && !e.altKey && e.key.toLowerCase() === 'l') {
         if (toggleLockSelection()) e.preventDefault()
@@ -389,14 +485,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
         const picked = state.selectedElement
         const pickedFrame = state.canvas?.frames.find((f) => f.id === picked?.frameId)
         const frames = state.canvas?.frames.filter((f) => selectedIds.includes(f.id)) ?? []
-        /* don't hijack ⌘C when the user is copying selected text */
-        if (e.key === 'c' && !window.getSelection()?.toString()) {
-          if (picked && pickedFrame) {
-            e.preventDefault()
-            copyLayers(pickedFrame, pickedSelectors(state))
-          } else if (!picked && frames.length) copyFrames(frames)
-        }
-        if (canEdit && e.key === 'd' && frames.length) {
+        if (canEdit && e.key.toLowerCase() === 'd' && frames.length) {
           e.preventDefault()
           if (picked && pickedFrame) duplicateLayers(pickedFrame, pickedSelectors(state))
           else if (!picked) duplicateFrames(frames)
@@ -405,43 +494,62 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [canvasId, hideUiActive]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [canvasId, hideUiActive, presenting]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  /* ⌘V lands here as a real paste event: clipboard images upload and drop in
-     as frames; otherwise a copied frame (⌘C) pastes centered. Handled on
-     'paste' rather than keydown so the browser hands us the clipboard bytes
-     without a permission prompt. */
+  /* Native copy/paste events let us write the selection's token and read
+     clipboard images without asking for clipboard-read permission. */
   useEffect(() => {
+    function onCopy(e: ClipboardEvent) {
+      if (isTypingTarget(e.target) || window.getSelection()?.toString() || !e.clipboardData) return
+      const state = useStore.getState()
+      const picked = state.selectedElement
+      const frame = state.canvas?.frames.find((f) => f.id === picked?.frameId)
+      let copy: () => boolean | void
+      if (picked) {
+        if (!frame) return
+        const selectors = pickedSelectors(state)
+        copy = () => copyPicked(frame, selectors)
+      } else {
+        const frames = state.canvas?.frames.filter((f) => state.selectedIds.includes(f.id)) ?? []
+        if (!frames.length) return
+        copy = () => copyFrames(frames)
+      }
+      if (writeCanvasClipboard(copy, e.clipboardData)) e.preventDefault()
+    }
     function onPaste(e: ClipboardEvent) {
-      const target = e.target as HTMLElement
-      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return
+      if (isTypingTarget(e.target)) return
       /* every paste lands a frame or a layer */
       if (!canEditOpenCanvas(useStore.getState())) return
-      const images = [...(e.clipboardData?.files ?? [])].filter((f) => f.type.startsWith('image/'))
-      if (images.length) {
+      /* bitmaps land as pictures, SVGs as editable shapes and PDFs as pages, in one row */
+      const incoming = splitIncoming([...(e.clipboardData?.files ?? [])], svgMarkupOf(e.clipboardData))
+      if (hasIncoming(incoming)) {
         e.preventDefault()
-        pasteImagesCentered(canvasId, images).catch((err: Error) => {
+        pasteFilesCentered(canvasId, incoming).catch((err: Error) => {
           setToast(translate('canvas.pasteImageFailed', { error: err.message }))
           window.setTimeout(() => setToast(null), 4000)
         })
-      } else if (hasElementClip()) {
+      } else if (isCanvasClipboard(e.clipboardData) && hasElementClip()) {
         e.preventDefault()
         const state = useStore.getState()
         const picked = state.selectedElement
         const frame = state.canvas?.frames.find((f) => f.id === (picked?.frameId ?? state.selectedId))
         if (frame) pasteLayer(frame, picked?.selector ?? null)
-      } else if (hasFrameClip()) {
+      } else if (isCanvasClipboard(e.clipboardData) && hasFrameClip()) {
         e.preventDefault()
         pasteFrameCentered(canvasId)
       }
     }
+    window.addEventListener('copy', onCopy)
     window.addEventListener('paste', onPaste)
-    return () => window.removeEventListener('paste', onPaste)
+    return () => {
+      window.removeEventListener('copy', onCopy)
+      window.removeEventListener('paste', onPaste)
+    }
   }, [canvasId])
 
-  /* Image files dragged in from the desktop land as frames centered on the
-     drop point. Every file drag is claimed, so a drop the canvas cannot take
-     (a viewer, a PDF) is refused instead of the browser opening the file in
+  /* Image, SVG and PDF files dragged in from the desktop land as frames
+     centered on the drop point. Every file drag is claimed, so a drop the
+     canvas cannot take (a viewer, a spreadsheet) is refused instead of the browser opening the file in
      place of the canvas; a drop the composer already took is left to it.
      While a file is over the page every frame keeps its shield up, or a
      frame being edited would swallow the drop in its iframe. Enter and leave
@@ -474,9 +582,9 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
       if (!carriesFiles(e) || e.defaultPrevented) return
       e.preventDefault()
       if (!canEditOpenCanvas(useStore.getState())) return
-      const images = [...(e.dataTransfer?.files ?? [])].filter((f) => f.type.startsWith('image/'))
-      if (!images.length) return
-      dropImages(canvasId, images, { x: e.clientX, y: e.clientY }).catch((err: Error) => {
+      const incoming = splitIncoming([...(e.dataTransfer?.files ?? [])])
+      if (!hasIncoming(incoming)) return
+      dropFiles(canvasId, incoming, { x: e.clientX, y: e.clientY }).catch((err: Error) => {
         setToast(translate('canvas.dropImageFailed', { error: err.message }))
         window.setTimeout(() => setToast(null), 4000)
       })
@@ -548,6 +656,9 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
   }
 
   const me = getIdentity()
+  /* the face's photo comes from the account, not the room: our own presence
+     is never in the roster */
+  const { data: session } = authClient.useSession()
   const others = useMemo(
     () => Object.values(presences).filter((p) => p.clientId !== me.clientId),
     [presences, me.clientId],
@@ -568,8 +679,13 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
   const selectedElement = useStore((s) => s.selectedElement)
   const elementPanelOpen = useStore((s) => s.elementPanelOpen)
   const panelElement = elementPanelOpen && selectedElement?.frameId === selectedFrame?.id ? selectedElement : null
-  /* the frame Inspector or the element panel, whichever has the slot */
-  const propertiesShown = !readOnly && !!selectedFrame && !deferPanel && (!!panelElement || inspectorOpen)
+  /* with nothing selected the slot is the page's own settings, once opened
+     from the rail, until closed */
+  const pagePanelOpen = useStore((s) => s.pagePanelOpen)
+  const pageShown = !readOnly && !selectedFrame && pagePanelOpen && !deferPanel
+  /* the frame Inspector, the element panel or the Page panel, whichever has the slot */
+  const propertiesShown =
+    (!readOnly && !!selectedFrame && !deferPanel && (!!panelElement || inspectorOpen)) || pageShown
   /* ⇧R docks the rulers on the canvas's top and left edges; the bar and the
      floating chrome step in past them (the same test Stage draws them by) */
   const rulers = useStore((s) => s.rulers)
@@ -653,7 +769,11 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
      it the whole window back */
   const stageBounds: StageInsets | undefined =
     docked && !uiHidden ? { top: DOCKED_BAR_H, right: chrome.right, bottom: 0, left: chrome.left } : undefined
-  const meFace = { name: me.name, color: presences[me.clientId]?.color ?? 'var(--brand)' }
+  const meFace = {
+    name: me.name,
+    image: avatarUrl(session?.user.image),
+    color: presences[me.clientId]?.color ?? 'var(--brand)',
+  }
 
   function openConnect() {
     posthog.capture('agent_connection_opened')
@@ -714,9 +834,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
                 {role === 'comment' ? t('canvas.canComment') : t('canvas.viewOnly')}
               </Badge>
             )}
-            <Badge className="max-md:hidden" title={t('canvas.canvasIdTitle')}>
-              {canvasId}
-            </Badge>
+            <CanvasIdMenu canvasId={canvasId} onCopied={showToast} />
             {connected ? (
               <span className="ml-1 whitespace-nowrap text-ink-faint max-lg:hidden">{t('canvas.autoSaved')}</span>
             ) : (
@@ -734,7 +852,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
             className="mr-1 flex items-center min-[1181px]:hidden"
             title={others.map((p) => p.name).join(', ') || t('canvas.justYou')}
           >
-            <PresenceFace name={meFace.name} color={meFace.color} kind="user" />
+            <PresenceFace name={meFace.name} image={meFace.image} color={meFace.color} kind="user" />
             <span className="-ml-[7px] flex items-center">
               <PeerAvatars others={others} />
             </span>
@@ -767,9 +885,9 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
             <Tooltip
               label={
                 selectedId
-                  ? t('canvas.presentFromFrame')
+                  ? `${t('canvas.presentFromFrame')} · ${PRESENT_SHORTCUT_HINT}`
                   : playFrom
-                    ? t('canvas.presentPrototype')
+                    ? `${t('canvas.presentPrototype')} · ${PRESENT_SHORTCUT_HINT}`
                     : t('canvas.addFrameToPresent')
               }
               side="bottom"
@@ -803,7 +921,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
             className="mr-1 flex items-center max-sm:hidden"
             title={others.map((p) => p.name).join(', ') || t('canvas.justYou')}
           >
-            <PresenceFace name={meFace.name} color={meFace.color} kind="user" />
+            <PresenceFace name={meFace.name} image={meFace.image} color={meFace.color} kind="user" />
             <span className="-ml-[7px] flex items-center">
               <PeerAvatars others={others} />
             </span>
@@ -935,6 +1053,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
           {!isMobile && !readOnly && selectedFrame && inspectorOpen && !panelElement && !deferPanel && (
             <Inspector frame={selectedFrame} surface={panelSurface} style={{ right: chrome.properties }} />
           )}
+          {!isMobile && pageShown && <PagePanel surface={panelSurface} style={{ right: chrome.properties }} />}
           {!isMobile && showActivity && (
             <ActivityPanel
               canvasId={canvasId}
@@ -959,9 +1078,14 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
               agentsOpen={showActivity}
               onToggleAgents={() => setShowActivity((open) => !open)}
               inspectorOpen={propertiesShown}
-              inspectorAvailable={!!selectedFrame && !readOnly}
+              inspectorAvailable={!readOnly}
+              inspectTarget={selectedFrame ? 'frame' : 'page'}
               onToggleInspector={() => {
                 const s = useStore.getState()
+                if (!selectedFrame) {
+                  s.setPagePanelOpen(!s.pagePanelOpen)
+                  return
+                }
                 if (propertiesShown) {
                   /* the element panel and the inspector share the slot —
                      hiding it closes whichever is showing */
@@ -1924,7 +2048,7 @@ function GithubSection({
       .catch(() => setAppEnabled(false))
   }, [canvasId])
 
-  /* back from GitHub's install screen: swap the pass for the repo list */
+  /* back from GitHub: swap the pass for the repo list */
   useEffect(() => {
     if (!installPass) return
     api
@@ -1958,7 +2082,6 @@ function GithubSection({
     try {
       const conn = await api.connectGithub(canvasId, { repo: fullName, pass: installPass })
       setConnections((c) => [conn, ...(c ?? [])])
-      setPickerRepos((r) => r?.filter((x) => x.fullName !== fullName) ?? null)
       setBusy(null)
       posthog.capture('github_repo_connected', { via: 'app' })
     } catch (e) {
@@ -2007,6 +2130,11 @@ function GithubSection({
     setConnections((c) => c?.filter((x) => x.id !== connId) ?? null)
   }
 
+  /* the picker offers what this canvas has not connected yet */
+  const unconnectedRepos = pickerRepos?.filter(
+    (r) => !connections?.some((conn) => conn.repo.toLowerCase() === r.fullName.toLowerCase()),
+  )
+
   if (forbidden) {
     return (
       <>
@@ -2047,10 +2175,10 @@ function GithubSection({
             </div>
           </div>
         ))}
-        {pickerRepos && (
+        {unconnectedRepos && (
           <div className="flex flex-col gap-1.5 rounded-[11px] border border-line bg-paper p-2.5">
             <b className="text-[12px] text-ink-soft">{t('canvas.pickRepo')}</b>
-            {pickerRepos.map((r) => (
+            {unconnectedRepos.map((r) => (
               <div key={r.fullName} className="flex items-center gap-2 text-[13px]">
                 <GithubIcon width={13} height={13} className="shrink-0 text-ink-faint" />
                 <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[12px]">
@@ -2067,7 +2195,19 @@ function GithubSection({
                 </Button>
               </div>
             ))}
-            {!pickerRepos.length && <Note>{t('canvas.allConnected')}</Note>}
+            {!unconnectedRepos.length && <Note>{t('canvas.allConnected')}</Note>}
+            <div className="flex items-center gap-3 pt-1">
+              <Button variant="bare" size="inline" className="text-ink-faint" asChild>
+                <a href={`/api/canvases/${canvasId}/github/app/install`} target="_blank" rel="noreferrer">
+                  {t('canvas.addRepos')}
+                </a>
+              </Button>
+              {/* asks GitHub again rather than re-reading the pass: an
+                  installation made in the other tab is only in a new one */}
+              <Button variant="bare" size="inline" className="text-ink-faint" disabled={!!busy} onClick={startInstall}>
+                {t('canvas.refreshRepos')}
+              </Button>
+            </div>
           </div>
         )}
         {appEnabled && !pickerRepos && (
@@ -2131,6 +2271,47 @@ function GithubSection({
         backDisabled={!!busy}
       />
     </>
+  )
+}
+
+/* The id badge in the bar opens a menu that copies the id (what agents hand
+   the MCP tools) or the canvas link. */
+function CanvasIdMenu({ canvasId, onCopied }: { canvasId: string; onCopied: (msg: string) => void }) {
+  const t = useT()
+  async function copy(text: string, msg: string) {
+    try {
+      await navigator.clipboard.writeText(text)
+      onCopied(msg)
+    } catch {
+      onCopied(t('canvas.copyFailed'))
+    }
+  }
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        {/* Pressable forwards the trigger's ref (Badge does not), so the menu
+            anchors to the badge and focus returns to it on close */}
+        <Pressable
+          layout="inline"
+          focus="ring"
+          aria-label={t('canvas.canvasIdMenu')}
+          title={t('canvas.canvasIdTitle')}
+          className={cn(badgeVariants({ interactive: true }), 'max-md:hidden data-[state=open]:bg-current/10')}
+        >
+          {canvasId}
+        </Pressable>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent side="bottom" align="start" width="sm">
+        <DropdownMenuItem onSelect={() => void copy(canvasId, t('canvas.idCopied'))}>
+          <CopyIcon size="rail" />
+          {t('canvas.copyId')}
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => void copy(`${location.origin}/c/${canvasId}`, t('canvas.linkCopied'))}>
+          <LinkIcon size="rail" />
+          {t('canvas.copyLink')}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 

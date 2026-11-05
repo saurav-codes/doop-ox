@@ -1,5 +1,6 @@
 import type { BillingInterval, WorkspaceStatus } from './billing.ts'
 import type { CanvasRole, LinkAccess } from './canvasRole.ts'
+import type { DesignToken } from './designTokens.ts'
 
 export interface Frame {
   id: string
@@ -25,6 +26,9 @@ export interface Frame {
    *  deleted from the stage until it is unlocked (Layers panel, Inspector,
    *  ⌘⇧L, or an agent via update_frame) */
   locked?: boolean
+  /** Stacking order on its page (back to front; see shared/frameStack.ts).
+   *  Unset on frames made before stacking existed: they stack by createdAt. */
+  z?: number
   /** Human sign-off for implementation. Missing/null means draft. Design
    * edits retain the attribution but change the status to needs_review. */
   approval?: FrameApproval | null
@@ -74,8 +78,9 @@ export interface CanvasMeta {
   previewFrameId?: string
   /** agents that have worked on this canvas (most recent first) */
   agents?: { name: string; owner?: string; lastAt?: number }[]
-  /** the owner first, then everyone invited — the home tile's avatar stack */
-  people?: { id: string; name: string }[]
+  /** the owner first, then everyone invited — the home tile's avatar stack;
+   *  `image` is a profile photo's URL when the person uploaded one */
+  people?: { id: string; name: string; image?: string }[]
 }
 
 /** The dashboard/gallery preview render (`/i/<id>.jpg?preview`) clips a
@@ -124,6 +129,11 @@ export interface CanvasPageInfo {
    *  Set only through the flow-start route or MCP tool; page-list saves keep
    *  whatever the server already has. */
   startFrameId?: string
+  /** the page's own canvas colour (`#rrggbb`, shared/pageBackground.ts),
+   *  shown in place of the viewer's theme paper. Set only through the
+   *  background route or MCP tool; page-list saves keep it, as they keep
+   *  the flow start. */
+  background?: string
 }
 
 /** A ruler guide: an infinite line on one page of a canvas, in world px.
@@ -171,6 +181,10 @@ export interface Canvas {
   guides?: CanvasGuide[]
   /** named design docs (brand rules, style recipes) every actor on the canvas follows */
   guidelines?: GuidelineDoc[]
+  /** design tokens (shared/designTokens.ts): the CSS custom properties frames use as var(--name) */
+  tokens?: DesignToken[]
+  /** the token themes (light, dark, …) in display order; a token may carry a value per theme */
+  tokenThemes?: string[]
   /** frames pinned to Memory as style exemplars — HTML snapshotted at pin time */
   references?: MemoryReference[]
 }
@@ -212,6 +226,8 @@ export interface WorkspaceMember {
   userId: string
   name: string
   email: string
+  /** the profile photo's URL when the person uploaded one */
+  image?: string
   role: WorkspaceRole
   addedAt: number
 }
@@ -330,6 +346,8 @@ export interface Presence {
   /** Authenticated identity for people, shared across their connections. */
   userId?: string
   name: string
+  /** a person's profile photo (shared/avatar.ts), else initials */
+  image?: string
   color: string
   kind: ActorKind
   cursor?: { x: number; y: number }
@@ -465,9 +483,11 @@ export interface ElementComment {
   snippet: string
   /** canvas comment: the page it sits on … */
   pageId?: string
-  /** … and its world point on that page */
+  /** Clicked point: frame design coordinates, or world coordinates on a canvas page. */
   x?: number
   y?: number
+  /** Element top-left at placement time; a moved element uses its current top-left. */
+  elementOrigin?: { x: number; y: number }
   from: string
   /** account id of the human who left it — decides which model credential runs it */
   fromUserId?: string
@@ -555,6 +575,8 @@ export type ServerMessage =
   | { type: 'guide'; id: string; guide: CanvasGuide | null; actor: Actor }
   /** a style-guide doc was written, moved (doc set) or deleted (doc null) */
   | { type: 'guidelines'; name: string; doc: GuidelineDoc | null; actor: Actor }
+  /** the canvas's design tokens changed: the whole list after the change */
+  | { type: 'tokens'; tokens: DesignToken[]; themes: string[]; actor: Actor }
   /** a frame was pinned to (reference set) or unpinned from (null) Memory */
   | { type: 'reference'; id: string; reference: MemoryReference | null; actor: Actor }
   /** a design decision was captured into Memory */
